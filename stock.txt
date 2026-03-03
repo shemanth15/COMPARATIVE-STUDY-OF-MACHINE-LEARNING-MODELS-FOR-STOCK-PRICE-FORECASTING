@@ -1,0 +1,213 @@
+import tkinter as tk
+from tkinter import messagebox
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import ta
+import lightgbm as lgb
+from datetime import datetime, timedelta
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+
+# Function for the stock prediction
+def predict_stock_movement_lightgbm(stock_symbol, checkbox_var):
+    if checkbox_var.get() == 0:
+        messagebox.showwarning("Disclaimer Not Accepted", "You must accept the disclaimer to proceed.")
+        return
+
+    # 1) Get live date/time
+    live_dt = datetime.now()
+    print(f"Live Date and Time: {live_dt}")
+
+    # 2) Get stock symbol from the user
+    stock_symbol = stock_symbol.strip().upper()
+
+    if '.NS' in stock_symbol or '.BO' in stock_symbol:
+        currency_symbol = '₹'
+    else:
+        currency_symbol = '$'
+
+    try:
+        ticker = yf.Ticker(stock_symbol)
+        live_price = ticker.history(period="1d", interval="1m")['Close'].dropna().iloc[-1]
+        print(f"Live Stock Price: {currency_symbol}{live_price:.2f}")
+    except Exception as e:
+        print(f"Error fetching live stock price: {e}")
+        return
+
+    # 3) Download historical data
+    start_date = '2015-01-01'
+    end_date = datetime.now().strftime('%Y-%m-%d')
+
+    try:
+        df = yf.download(stock_symbol, start=start_date, end=end_date, interval='1d', progress=False)
+    except Exception as e:
+        print(f"Error fetching historical data: {e}")
+        return
+
+    if df.empty:
+        print("No historical data found for this stock.")
+        return
+
+    df = df[['Open', 'High', 'Low', 'Close', 'Volume']].copy()
+    df.columns = ['open', 'high', 'low', 'close', 'volume']
+    df.index = pd.to_datetime(df.index)
+
+    df['next_day_close'] = df['close'].shift(-1)
+    df['price_change_percentage'] = ((df['next_day_close'] - df['close']) / df['close']) * 100
+    df['target'] = (df['price_change_percentage'] > 0).astype(int)
+
+    df['roc'] = ta.momentum.ROCIndicator(df['close']).roc()
+    df['rsi'] = ta.momentum.RSIIndicator(df['close']).rsi()
+    df['ema'] = ta.trend.EMAIndicator(df['close'], window=20).ema_indicator()
+    df['stoch'] = ta.momentum.StochasticOscillator(df['high'], df['low'], df['close']).stoch()
+
+    macd = ta.trend.MACD(df['close'])
+    df['macd_line'] = macd.macd()
+    df['macd_signal'] = macd.macd_signal()
+
+    df['obv'] = ta.volume.OnBalanceVolumeIndicator(df['close'], df['volume']).on_balance_volume()
+    df['volume_log'] = np.log1p(df['volume'])
+
+    df.dropna(inplace=True)
+    if len(df) < 100:
+        print("Not enough data after dropping NaNs.")
+        return
+
+    X = df.drop(['next_day_close', 'price_change_percentage', 'target'], axis=1)
+    y = df['target']
+
+    test_size = int(len(X) * 0.1)
+    X_train, X_test = X.iloc[:-test_size], X.iloc[-test_size:]
+    y_train, y_test = y.iloc[:-test_size], y.iloc[-test_size:]
+
+    model = lgb.LGBMClassifier(
+        n_estimators=1000,
+        learning_rate=0.01,
+        max_depth=8,
+        subsample=0.9,
+        colsample_bytree=0.9,
+        random_state=42,
+        verbosity=-1
+    )
+    model.fit(X_train, y_train)
+
+    y_pred = model.predict(X_test)
+
+    # 4) Forecasting
+    last_date = df.index[-1]
+    last_row = df.iloc[-1].copy()
+
+    future_dates = pd.date_range(start=last_date + timedelta(days=1), end='2026-12-31', freq='B')
+    future_closes = []
+    prev_row = last_row.copy()
+
+    def single_day_prediction(prev_row):
+        new_row = prev_row.copy()
+        new_row['open'] = new_row['close']
+        new_row['high'] = new_row['close']
+        new_row['low'] = new_row['close']
+        new_row['volume_log'] = np.log1p(new_row['volume'])
+
+        x_input = pd.DataFrame([new_row[X.columns]], columns=X.columns)
+
+        prob_up = model.predict_proba(x_input)[0][1]
+        pred_up = 1 if prob_up >= 0.5 else 0
+
+        daily_pct = (1 if pred_up else -1) * 0.3 * (0.5 + prob_up / 2)
+        new_close = new_row['close'] * (1 + daily_pct / 100.0)
+
+        new_row['close'] = new_close
+        return new_row, new_close
+
+    for d in future_dates:
+        pred_row, predicted_close = single_day_prediction(prev_row)
+        future_closes.append((d, predicted_close))
+        prev_row = pred_row.copy()
+
+    future_df = pd.DataFrame(future_closes, columns=['Date', 'close'])
+    future_df.set_index('Date', inplace=True)
+
+    print("\nFuture Price Projections:")
+    start_price = df['close'].iloc[-1]
+    horizons = {'1 Month': 21, '3 Months': 63, '6 Months': 126, '1 Year': 252}
+
+    for label, days in horizons.items():
+        if len(future_df) >= days:
+            future_price = future_df['close'].iloc[days - 1]
+            change_pct = (future_price - start_price) / start_price * 100
+            print(f"{label + ':':<12} {currency_symbol}{future_price:.2f} ({change_pct:.1f}%)")
+
+    final_price_2026 = future_df['close'].iloc[-1]
+    change_pct_2026 = (final_price_2026 - start_price) / start_price * 100
+    print(f"{'2026 Target:':<12} {currency_symbol}{final_price_2026:.2f} ({change_pct_2026:.1f}%)")
+
+    # Plotting the historical and forecasted data inside Jupyter interface
+    fig, ax = plt.subplots(figsize=(12, 6))
+    ax.plot(df.index, df['close'], label='Historical Price', color='blue')
+    ax.axvline(df.index[-test_size], color='red', linestyle='--', label='Train/Test Split')
+    ax.set_title(f"{stock_symbol} Historical Close Price (LightGBM Model)")
+    ax.set_xlabel("Date")
+    ax.set_ylabel("Price")
+    ax.set_xlim([df.index[0], pd.Timestamp('2026-12-31')])
+    ax.xaxis.set_major_locator(mdates.YearLocator())
+    ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
+    ax.legend()
+    ax.grid(True)
+
+    plt.show()
+
+    # Plotting the forecasted data
+    fig, ax = plt.subplots(figsize=(12, 6))
+    ax.plot(df.index, df['close'], label='Historical', color='blue')
+    ax.plot(future_df.index, future_df['close'], label='Forecast (LightGBM)', color='green', linestyle='--')
+    ax.set_title(f"{stock_symbol} Price History & LightGBM Forecast")
+    ax.set_xlabel("Date")
+    ax.set_ylabel("Price")
+    ax.set_xlim([df.index[0], pd.Timestamp('2026-12-31')])
+    ax.xaxis.set_major_locator(mdates.YearLocator())
+    ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
+    ax.legend()
+    ax.grid(True)
+
+    plt.show()
+
+# GUI for disclaimer
+def show_disclaimer_and_get_input():
+    def on_submit():
+        stock_symbol = stock_symbol_var.get()
+        predict_stock_movement_lightgbm(stock_symbol, checkbox_var)
+
+    window = tk.Tk()
+    window.title("Stock Prediction Disclaimer")
+
+    # Disclaimer label
+    disclaimer_text = (
+        "The following stock price predictions are based on historical data and machine learning models.\n"
+        "These predictions are for informational purposes only and should not be used as financial advice.\n"
+        "Investing in stocks carries risk, and past performance is not indicative of future results."
+    )
+    disclaimer_label = tk.Label(window, text=disclaimer_text, justify="left")
+    disclaimer_label.pack(padx=10, pady=10)
+
+    # Checkbox to accept the disclaimer
+    checkbox_var = tk.IntVar()
+    checkbox = tk.Checkbutton(window, text="I accept the disclaimer", variable=checkbox_var)
+    checkbox.pack(pady=10)
+
+    # Entry to input stock symbol
+    stock_symbol_var = tk.StringVar()
+    stock_symbol_label = tk.Label(window, text="Enter stock symbol (e.g., TCS.NS, AAPL):")
+    stock_symbol_label.pack(pady=5)
+    stock_symbol_entry = tk.Entry(window, textvariable=stock_symbol_var)
+    stock_symbol_entry.pack(pady=5)
+
+    # Submit button
+    submit_button = tk.Button(window, text="Go", command=on_submit)
+    submit_button.pack(pady=10)
+
+    window.mainloop()
+
+# Start the GUI
+show_disclaimer_and_get_input()
