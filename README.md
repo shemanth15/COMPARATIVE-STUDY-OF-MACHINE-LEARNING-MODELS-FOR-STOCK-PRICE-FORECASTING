@@ -1,0 +1,2 @@
+# COMPARATIVE-STUDY-OF-MACHINE-LEARNING-MODELS-FOR-STOCK-PRICE-FORECASTING
+This project focuses on building a real-time stock price prediction system using Machine Learning and Deep Learning techniques. The objective is to analyze historical stock market data, Historical stock data is collected using the yfinance API, which provides key market attributes such as Open, High, Low, Close prices, and trading Volume
